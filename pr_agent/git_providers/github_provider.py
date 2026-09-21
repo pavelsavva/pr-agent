@@ -1145,14 +1145,21 @@ class GithubProvider(GitProvider):
             if own_login:
                 for comment in self.pr.get_review_comments():
                     seen += 1
+                    raw = getattr(comment, "raw_data", None) or {}
                     author = getattr(comment, "user", None)
-                    login = getattr(author, "login", "") or ""
+                    login = (getattr(author, "login", "") or ""
+                             or (raw.get("user") or {}).get("login", "") or "")
                     if login.casefold() != own_login:
                         continue
-                    path = getattr(comment, "path", "") or ""
+                    path = getattr(comment, "path", "") or raw.get("path", "") or ""
                     try:
-                        end = comment.line or comment.original_line
-                        start = comment.start_line or comment.original_start_line or end
+                        end = (getattr(comment, "line", None)
+                               or getattr(comment, "original_line", None)
+                               or raw.get("line") or raw.get("original_line"))
+                        start = (getattr(comment, "start_line", None)
+                                 or getattr(comment, "original_start_line", None)
+                                 or raw.get("start_line") or raw.get("original_start_line")
+                                 or end)
                         locations.add((str(path).lstrip("/"), int(start), int(end)))
                     except (TypeError, ValueError, AttributeError):
                         continue
