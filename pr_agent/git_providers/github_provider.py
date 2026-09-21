@@ -1116,6 +1116,37 @@ class GithubProvider(GitProvider):
     def get_issue_comments(self):
         return self.pr.get_issue_comments()
 
+    def get_recent_inline_comment_bodies(self) -> list:
+        # Funnel fork: re-read current review-comment bodies so key-issue
+        # inline publication can verify newly posted findings. Re-reading
+        # (instead of tracking in-memory like other providers) keeps
+        # verification truthful on partial publish failures.
+        try:
+            return [comment.body or "" for comment in self.pr.get_review_comments()]
+        except Exception as e:
+            get_logger().warning(f"Failed to list review comments for inline verification: {e}")
+            return []
+
+    def get_persistent_comment_bodies(self) -> list:
+        # Funnel fork: review + issue comment bodies for cross-run inline
+        # fingerprint dedup.
+        bodies = []
+        try:
+            for comment in self.pr.get_review_comments():
+                body = getattr(comment, "body", "") or ""
+                if body and body not in bodies:
+                    bodies.append(body)
+        except Exception as e:
+            get_logger().warning(f"Failed to list review comments for inline dedup: {e}")
+        try:
+            for comment in self.get_issue_comments():
+                body = getattr(comment, "body", "") or ""
+                if body and body not in bodies:
+                    bodies.append(body)
+        except Exception as e:
+            get_logger().warning(f"Failed to list issue comments for inline dedup: {e}")
+        return bodies
+
     def get_repo_settings(self):
         settings_files = []
         global_settings = self._get_global_repo_settings()
