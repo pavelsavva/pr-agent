@@ -1139,21 +1139,27 @@ class GithubProvider(GitProvider):
         # bot, for location-based cross-run dedup of inline findings.
         locations = set()
         try:
+            import os as _os
             own_login = (self.get_user_id() or "").casefold()
-            if not own_login:
-                return locations
-            for comment in self.pr.get_review_comments():
-                author = getattr(comment, "user", None)
-                login = getattr(author, "login", "") or ""
-                if login.casefold() != own_login:
-                    continue
-                path = getattr(comment, "path", "") or ""
-                try:
-                    end = comment.line or comment.original_line
-                    start = comment.start_line or comment.original_start_line or end
-                    locations.add((str(path).lstrip("/"), int(start), int(end)))
-                except (TypeError, ValueError, AttributeError):
-                    continue
+            seen = 0
+            if own_login:
+                for comment in self.pr.get_review_comments():
+                    seen += 1
+                    author = getattr(comment, "user", None)
+                    login = getattr(author, "login", "") or ""
+                    if login.casefold() != own_login:
+                        continue
+                    path = getattr(comment, "path", "") or ""
+                    try:
+                        end = comment.line or comment.original_line
+                        start = comment.start_line or comment.original_start_line or end
+                        locations.add((str(path).lstrip("/"), int(start), int(end)))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+            get_logger().info(
+                f"Inline location dedup scan: own_login={own_login!r} "
+                f"actions_env={_os.environ.get('GITHUB_ACTIONS')!r} "
+                f"review_comments_seen={seen} covered={len(locations)}")
         except Exception as e:
             get_logger().warning(f"Failed to list own inline locations for dedup: {e}")
         return locations
