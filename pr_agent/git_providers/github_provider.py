@@ -1707,7 +1707,7 @@ class GithubProvider(GitProvider):
                         comment_start_line = suggestion.get('relevant_lines_start', None)
                         comment_end_line = suggestion.get('relevant_lines_end', None)
                         original_suggestion = suggestion.get('original_suggestion', None) # needed for diff code
-                        if not comment_start_line or not comment_end_line or not original_suggestion:
+                        if not comment_start_line or not comment_end_line:
                             continue
 
                         # check if the comment is inside a valid hunk
@@ -1735,6 +1735,25 @@ class GithubProvider(GitProvider):
                                 # make the suggestion non-committable, yet multi line
                                 suggestion['relevant_lines_start'] = max(suggestion['relevant_lines_start'], patch_range_min['start'])
                                 suggestion['relevant_lines_end'] = min(suggestion['relevant_lines_end'], patch_range_min['end'])
+                                if suggestion['relevant_lines_start'] > suggestion['relevant_lines_end']:
+                                    # Funnel fork: the range missed the hunk entirely, so
+                                    # clamping inverted it. Collapse to a single line at
+                                    # the nearest hunk edge instead of 422ing at the API.
+                                    if comment_start_line < patch_range_min['start']:
+                                        edge = patch_range_min['start']
+                                    else:
+                                        edge = patch_range_min['end']
+                                    suggestion['relevant_lines_start'] = edge
+                                    suggestion['relevant_lines_end'] = edge
+                                if not original_suggestion:
+                                    # Funnel fork: key-issue inlines carry no
+                                    # suggestion diff, so there is no body to
+                                    # rewrite — the clamped range is the fix (an
+                                    # off-by-one start line otherwise 422s and the
+                                    # finding is lost to the summary).
+                                    get_logger().info(f"Comment was moved to a valid hunk, "
+                                                      f"start_line={suggestion['relevant_lines_start']}, end_line={suggestion['relevant_lines_end']}, file={file.filename}")
+                                    continue
                                 body = suggestion['body'].strip()
 
                                 # present new diff code in collapsible
