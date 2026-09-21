@@ -1102,6 +1102,13 @@ class GithubProvider(GitProvider):
             except Exception as e:
                 self.github_user_id = ""
                 # logging.exception(f"Failed to get user id, error: {e}")
+            if not self.github_user_id and os.environ.get("GITHUB_ACTIONS") == "true":
+                # Funnel fork: GET /user is unreliable for restricted
+                # GITHUB_TOKENs, which broke persistent-review updates
+                # (every run fell back to a standalone comment). Actions
+                # comments always post as this login, so it is the correct
+                # comparison target for author verification here.
+                self.github_user_id = "github-actions[bot]"
         return self.github_user_id
 
     def get_notifications(self, since: datetime):
