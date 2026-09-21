@@ -1134,6 +1134,30 @@ class GithubProvider(GitProvider):
             get_logger().warning(f"Failed to list review comments for inline verification: {e}")
             return []
 
+    def get_own_inline_comment_locations(self) -> set:
+        # Funnel fork: (path, start, end) of review comments authored by this
+        # bot, for location-based cross-run dedup of inline findings.
+        locations = set()
+        try:
+            own_login = (self.get_user_id() or "").casefold()
+            if not own_login:
+                return locations
+            for comment in self.pr.get_review_comments():
+                author = getattr(comment, "user", None)
+                login = getattr(author, "login", "") or ""
+                if login.casefold() != own_login:
+                    continue
+                path = getattr(comment, "path", "") or ""
+                try:
+                    end = comment.line or comment.original_line
+                    start = comment.start_line or comment.original_start_line or end
+                    locations.add((str(path).lstrip("/"), int(start), int(end)))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+        except Exception as e:
+            get_logger().warning(f"Failed to list own inline locations for dedup: {e}")
+        return locations
+
     def get_persistent_comment_bodies(self) -> list:
         # Funnel fork: review + issue comment bodies for cross-run inline
         # fingerprint dedup.

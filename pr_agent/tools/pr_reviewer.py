@@ -969,6 +969,18 @@ class PRReviewer:
             get_logger().warning("Inline key-issue publishing cannot verify existing Azure DevOps threads; "
                                  "keeping findings in the review summary")
             return data
+        # Funnel fork: locations our bot already covers with an inline.
+        # Finding text is reworded every run, so text fingerprints never
+        # match twice; without a location check each re-review reposts every
+        # finding as a duplicate thread. Covered issues stay in the summary
+        # (never dropped) so reworded insights are not lost.
+        covered_locations = set()
+        get_covered = getattr(self.git_provider, "get_own_inline_comment_locations", None)
+        if callable(get_covered):
+            try:
+                covered_locations = set(get_covered() or [])
+            except Exception as e:
+                get_logger().warning(f"Inline location dedup unavailable, error: {e}")
         remaining_issues = []
         candidate_comments = {}
         candidate_issues = {}
@@ -978,6 +990,15 @@ class PRReviewer:
             try:
                 comment = self._build_key_issue_comment(issue, diff_files)
                 if comment is None:
+                    remaining_issues.append(issue)
+                    continue
+                try:
+                    candidate_location = (str(comment.get("relevant_file", "")).lstrip("/"),
+                                          int(comment.get("relevant_lines_start")),
+                                          int(comment.get("relevant_lines_end")))
+                except (TypeError, ValueError):
+                    candidate_location = None
+                if candidate_location is not None and candidate_location in covered_locations:
                     remaining_issues.append(issue)
                     continue
                 fingerprint = key_issue_fingerprint(comment["relevant_file"], comment["body"])
