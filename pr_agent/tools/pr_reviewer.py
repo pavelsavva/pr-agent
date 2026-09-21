@@ -998,7 +998,19 @@ class PRReviewer:
                                           int(comment.get("relevant_lines_end")))
                 except (TypeError, ValueError):
                     candidate_location = None
-                if candidate_location is not None and candidate_location in covered_locations:
+                # Overlap, not exact match: the model re-anchors the same
+                # finding a line or two off between runs (observed 20-23 vs
+                # covered 21-23), so exact tuples would repost forever.
+                covered = False
+                if candidate_location is not None:
+                    candidate_file, candidate_start, candidate_end = candidate_location
+                    for (covered_file, covered_start, covered_end) in covered_locations:
+                        if covered_file != candidate_file:
+                            continue
+                        if not (candidate_end < covered_start or candidate_start > covered_end):
+                            covered = True
+                            break
+                if covered:
                     remaining_issues.append(issue)
                     continue
                 fingerprint = key_issue_fingerprint(comment["relevant_file"], comment["body"])
