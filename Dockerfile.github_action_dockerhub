@@ -1,1 +1,6 @@
-FROM pragent/pr-agent:github_action
+# Funnel fork: upstream's prebuilt v0.45.0 action image, plus our
+# GitHub inline-verification patch (pr_agent/git_providers/github_provider.py
+# on branch funnel/github-inline-verify). Pinned tag keeps this exact;
+# rebuilding from source on every run would add minutes for no benefit.
+FROM pragent/pr-agent:0.45.0-github_action
+COPY pr_agent/git_providers/github_provider.py /app/pr_agent/git_providers/github_provider.py
