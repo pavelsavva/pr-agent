@@ -98,12 +98,18 @@ class PRCodeSuggestionsIdentity(str, Enum):
     UNANCHORED = "<!-- pr-agent:improve:unanchored -->"
 
 
+# Funnel fork: separate hidden comment carrying review finding state, distinct from review/improve identities.
+class PRReviewStateIdentity(str, Enum):
+    STATE = "<!-- pr-agent:review:state -->"
+
+
 _ALL_COMMENT_IDENTITIES = (
     PRReviewIdentity.REGULAR.value,
     PRReviewIdentity.INCREMENTAL.value,
     PRCodeSuggestionsIdentity.SUMMARY.value,
     PRCodeSuggestionsIdentity.NO_SUGGESTIONS.value,
     PRCodeSuggestionsIdentity.UNANCHORED.value,
+    PRReviewStateIdentity.STATE.value,
 )
 _REVIEW_IDENTITY_HEADER_LINES = 5
 _MARKDOWN_PUNCTUATION_ESCAPE_TABLE = str.maketrans(

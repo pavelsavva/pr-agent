@@ -3,7 +3,7 @@ import copy
 import datetime
 import re
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from jinja2 import Environment, StrictUndefined
 
@@ -25,8 +25,15 @@ from pr_agent.algo.pr_processing import (
 )
 from pr_agent.algo.prompt_fragments import render_diff_hunk_format
 from pr_agent.algo.repo_context import build_repo_context
+
+# Funnel fork: finding state lives in its own hidden comment; partial runs reconcile per reviewed file.
 from pr_agent.algo.review_finding_state import (
     append_review_state,
+    build_review_state_comment,
+    build_round_summary,
+    extract_reviewed_files,
+    fit_review_state,
+    insert_round_summary,
     parse_review_state,
     reconcile_review_findings,
 )
@@ -38,9 +45,9 @@ from pr_agent.algo.utils import (
     ModelType,
     PRReviewHeader,
     PRReviewIdentity,
+    PRReviewStateIdentity,
     add_pr_review_identity,
     convert_to_markdown_v2,
-    get_pr_review_comment_identifiers,
     github_action_output,
     load_yaml,
     push_outputs,
@@ -61,10 +68,9 @@ MAX_REVIEW_COVERAGE_FILES = 50
 _SUGGESTION_FENCE_RE = re.compile(r"```[ \t]*suggestion\b", re.IGNORECASE)
 
 
-_STATE_BLOCK_INVALID_MARKER = "invalid_marker"
+# Funnel fork: state lives in a separate comment; only read-error and review-data still block advancement.
 _STATE_BLOCK_READ_ERROR = "read_error"
 _STATE_BLOCK_REVIEW_DATA = "review_data"
-_STATE_BLOCK_SIZE = "state_size"
 
 
 class PRReviewer:
@@ -77,6 +83,10 @@ class PRReviewer:
     prediction_data = None  # merged review dict; None means "parse self.prediction instead"
     review_chunk_count = 1
     review_failed_chunk_count = 0
+    # Funnel fork: per-model-call file sets for per-file resolvability.
+    _review_calls = None
+    _review_uncovered_files = None
+    _review_inline_published = 0
 
     def __init__(self, pr_url: str, is_answer: bool = False, is_auto: bool = False, args: list = None,
                  ai_handler: partial[BaseAiHandler,] = LiteLLMAIHandler):
@@ -113,8 +123,6 @@ class PRReviewer:
         self._review_state_result = None
         self._review_state_blocked = False
         self._review_state_block_reason = None
-        self._review_finding_previous_state = None
-        self._review_state_preserved = False
         question_str, answer_str = self._get_user_answers()
         self.pr_description, self.pr_description_files = (
             self.git_provider.get_pr_description(split_changes_walkthrough=True))
@@ -253,36 +261,7 @@ class PRReviewer:
             # Providers that support it (GitLab) can post the review's final comment as a resolvable thread.
             # This intent applies to the review only - never to status comments or the output of other tools.
             review_thread_kwargs = {"as_thread": True} if self.git_provider.should_publish_review_as_thread() else {}
-            state_block_reason = getattr(self, "_review_state_block_reason", None)
-            if state_blocked and (
-                state_block_reason == _STATE_BLOCK_INVALID_MARKER
-                or (
-                    state_block_reason == _STATE_BLOCK_SIZE
-                    and getattr(self, "_review_state_preserved", False)
-                )
-            ):
-                get_logger().warning(
-                    "Review finding state cannot be written safely; replacing the persistent review "
-                    "with a clean state marker"
-                )
-                persistent_args = dict(
-                    initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
-                    update_header=True,
-                    final_update_message=False,
-                    identity_marker=PRReviewIdentity.REGULAR.value,
-                    legacy_initial_header=f"{PRReviewHeader.REGULAR.value} 🔍",
-                    require_agent_authorship=True,
-                    fallback_on_error=False,
-                    **review_thread_kwargs,
-                )
-                persistent_write_failed = True
-                result = self.git_provider.publish_persistent_comment_full(
-                    pr_review, **persistent_args
-                )
-                persistent_write_failed = not self._persistent_publish_succeeded(result)
-                if persistent_write_failed:
-                    review_failed = True
-            elif state_blocked:
+            if state_blocked:
                 get_logger().warning(
                     "Review finding state is blocked by review data or provider read failure; "
                     "publishing without changing persistent state"
@@ -341,6 +320,11 @@ class PRReviewer:
                     )
                     pr_review = add_pr_review_identity(pr_review, identity_marker)
                 self.git_provider.publish_comment(pr_review, **review_thread_kwargs)
+
+            # Funnel fork: persist finding state in its own comment only after the review published.
+            # A failed state write never fails the review and never touches the review comment.
+            if not review_failed and not persistent_write_failed:
+                self._publish_review_finding_state()
         except Exception as e:
             review_failed = True
             get_logger().error(f"Failed to review PR: {e}")
@@ -464,13 +448,12 @@ class PRReviewer:
             return False
 
     def _load_review_finding_state(self):
-        identifiers = get_pr_review_comment_identifiers(full=True, incremental=False)
+        # Funnel fork: state lives only in its own hidden comment; legacy markers in the review comment are ignored.
         try:
-            invalid_marker_found = False
             for _comment, body in GitProvider._iter_persistent_comments(
                 self.git_provider,
-                identifiers,
-                identity_marker=PRReviewIdentity.REGULAR.value,
+                (PRReviewStateIdentity.STATE.value,),
+                identity_marker=PRReviewStateIdentity.STATE.value,
                 require_agent_authorship=True,
             ):
                 parsed = parse_review_state(body)
@@ -478,16 +461,10 @@ class PRReviewer:
                     self._review_state_blocked = False
                     self._review_state_block_reason = None
                     return parsed
-                if not parsed.valid and parsed.present:
-                    invalid_marker_found = True
-                    get_logger().warning(
-                        "Review finding state marker is malformed or unsupported; "
-                        "trying an older persistent review"
-                    )
-            if invalid_marker_found:
-                self._review_state_blocked = True
-                self._review_state_block_reason = _STATE_BLOCK_INVALID_MARKER
-                return None
+                get_logger().warning(
+                    "Review finding state comment is malformed or missing its marker; "
+                    "trying an older state comment"
+                )
         except Exception as e:
             self._review_state_blocked = True
             self._review_state_block_reason = _STATE_BLOCK_READ_ERROR
@@ -565,18 +542,144 @@ class PRReviewer:
             if isinstance(value, int) and value > 0:
                 update_suffix = f"\n\n#### (Review updated until commit {self._review_run_id()})\n"
                 # The shared persistent publisher adds the full-review identity
-                # before inserting the update suffix. Reserve both pieces so a
-                # complete state marker remains inside the provider limit.
+                # before inserting the update suffix. Reserve both pieces from
+                # the human-visible review budget.
                 identity_overhead = len(PRReviewIdentity.REGULAR.value) + 2
                 return value - len(update_suffix) - identity_overhead
         return None
+
+    def _state_comment_max_chars(self) -> int | None:
+        for attribute in ("max_comment_chars", "max_comment_length"):
+            value = getattr(self.git_provider, attribute, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    def _review_chunk_issue_count(self, data: Any) -> int | None:
+        # A chunk whose parsed review lacks a key-issues list has an UNKNOWN count;
+        # its files must never count as resolvable (never 0, never a merged total).
+        try:
+            review = data.get("review") if isinstance(data, dict) else None
+            if not isinstance(review, dict):
+                return None
+            issues = review.get("key_issues_to_review")
+            if isinstance(issues, list):
+                return len(issues)
+        except Exception:
+            pass
+        return None
+
+    def _current_diff_paths(self) -> set[str] | None:
+        try:
+            files = self.git_provider.get_diff_files() or []
+        except Exception as e:
+            get_logger().warning(f"Could not list PR diff files for resolvability, error: {e}")
+            return None
+        paths = set()
+        for file in files:
+            name = file.filename if hasattr(file, "filename") else file
+            cleaned = str(name or "").strip().strip(chr(96)).lstrip("/")
+            if cleaned:
+                paths.add(cleaned)
+        return paths
+
+    def _compute_resolvable_paths(
+        self,
+        previous_state: Any,
+    ) -> tuple[set[str] | None, bool]:
+        # A missing per-call record means nothing was reviewed: only files that left
+        # the diff are resolvable and the run is incomplete. A recorded None count is
+        # UNKNOWN (chunk without a key-issues list) and contributes nothing — never the
+        # merged total. The single-call flow fills its deferred count before calling.
+        calls = getattr(self, "_review_calls", None)
+        if calls is None:
+            calls = []
+            calls_missing = True
+        else:
+            calls_missing = False
+        try:
+            max_findings = int(get_settings().pr_reviewer.num_max_findings)
+        except (TypeError, ValueError):
+            max_findings = 0
+        remaining = list(getattr(self, "remaining_files_list", None) or [])
+        failed_chunks = int(getattr(self, "review_failed_chunk_count", 0) or 0)
+        resolvable: set[str] = set()
+        clipped_all: set[str] = set()
+        for entry in calls:
+            try:
+                files, clipped, count = entry
+            except (TypeError, ValueError):
+                continue
+            clipped_set = set(clipped or [])
+            clipped_all.update(clipped_set)
+            if count is None:
+                continue
+            try:
+                count_int: int | None = int(count)
+            except (TypeError, ValueError):
+                continue
+            if count_int is not None and count_int < max_findings:
+                for path in files or []:
+                    cleaned = str(path or "").strip().strip(chr(96)).lstrip("/")
+                    if cleaned and cleaned not in clipped_set:
+                        resolvable.add(cleaned)
+        diff_paths = self._current_diff_paths()
+        if diff_paths is not None and isinstance(previous_state, dict):
+            for finding in previous_state.get("findings", []) or []:
+                if not isinstance(finding, dict):
+                    continue
+                path = str(finding.get("path") or "").strip().strip(chr(96)).lstrip("/")
+                if path and path not in diff_paths:
+                    resolvable.add(path)
+        recorded_uncovered = getattr(self, "_review_uncovered_files", None)
+        if recorded_uncovered is not None:
+            complete = not bool(set(recorded_uncovered)) and failed_chunks == 0
+        else:
+            complete = (
+                not calls_missing
+                and not bool(remaining)
+                and failed_chunks == 0
+                and not bool(clipped_all)
+            )
+        return (resolvable, complete)
+
+    def _round_uncovered_count(self, complete: bool) -> int:
+        if complete:
+            return 0
+        return len(set(getattr(self, "_review_uncovered_files", None) or set()))
+
+    def _publish_review_finding_state(self) -> None:
+        result = getattr(self, "_review_state_result", None)
+        if result is None or getattr(self, "_review_state_blocked", False):
+            return
+        try:
+            max_chars = self._state_comment_max_chars()
+            fitted = fit_review_state(result.state, max_chars)
+            body = build_review_state_comment(fitted)
+            written = self.git_provider.publish_persistent_comment_full(
+                body,
+                initial_header=PRReviewStateIdentity.STATE.value,
+                update_header=False,
+                final_update_message=False,
+                identity_marker=PRReviewStateIdentity.STATE.value,
+                require_agent_authorship=True,
+                fallback_on_error=False,
+            )
+            if written is None or written is False:
+                get_logger().warning(
+                    "Failed to persist review finding state; "
+                    "the next review round will treat these findings as new"
+                )
+        except Exception as e:
+            get_logger().warning(
+                "Failed to persist review finding state; "
+                f"the next review round will treat these findings as new, error: {e}"
+            )
 
     def _prepare_review_finding_state(self, data: dict) -> None:
         self._review_state_result = None
         self._review_state_blocked = False
         self._review_state_block_reason = None
-        self._review_finding_previous_state = None
-        self._review_state_preserved = False
         if not self._review_finding_state_enabled():
             return
         if not isinstance(data.get("review"), dict):
@@ -585,10 +688,10 @@ class PRReviewer:
             get_logger().warning("Review data is invalid; preserving persistent finding state")
             return
 
+        # The loader only returns None on provider read errors, or a valid parsed
+        # state (fresh when no usable state comment exists).
         parsed = self._load_review_finding_state()
-        if parsed is not None and parsed.valid:
-            self._review_finding_previous_state = parsed.state
-        if parsed is None and self._review_state_block_reason != _STATE_BLOCK_INVALID_MARKER:
+        if parsed is None:
             return
         current_findings = self._review_findings_from_data(data)
         if current_findings is None:
@@ -596,29 +699,29 @@ class PRReviewer:
             self._review_state_block_reason = _STATE_BLOCK_REVIEW_DATA
             get_logger().warning("Review finding data is invalid; skipping persistent state update")
             return
-        if self._review_state_blocked:
-            if self._review_state_block_reason == _STATE_BLOCK_INVALID_MARKER:
-                self._review_state_result = reconcile_review_findings(
-                    None,
-                    current_findings,
-                    allow_resolution=False,
-                    excluded_files=self.remaining_files_list,
-                    head_sha=self._review_head_sha(),
-                    run_id=self._review_run_id(),
+        if self.prediction_data is None and isinstance(self._review_calls, list):
+            # Single-call flow: fill the deferred per-call issue count now that the
+            # parsed data is known to carry a valid key-issues list.
+            filled_calls = []
+            for entry in self._review_calls:
+                try:
+                    files, clipped, count = entry
+                except (TypeError, ValueError):
+                    filled_calls.append(entry)
+                    continue
+                filled_calls.append(
+                    (files, clipped, len(current_findings) if count is None else count)
                 )
-            return
-        try:
-            max_findings = int(get_settings().pr_reviewer.num_max_findings)
-        except (TypeError, ValueError):
-            max_findings = 0
+            self._review_calls = filled_calls
         allow_resolution = (
             bool(self.prediction)
             and not bool(getattr(self.incremental, "is_incremental", False))
-            and not bool(self.remaining_files_list)
             and parsed.valid
             and current_findings is not None
-            and len(current_findings) < max_findings
         )
+        resolvable_paths, complete = self._compute_resolvable_paths(parsed.state)
+        if not allow_resolution:
+            complete = False
         result = reconcile_review_findings(
             parsed.state,
             current_findings,
@@ -626,9 +729,13 @@ class PRReviewer:
             excluded_files=self.remaining_files_list,
             head_sha=self._review_head_sha(),
             run_id=self._review_run_id(),
+            resolvable_paths=resolvable_paths,
+            complete=complete,
         )
-        if parsed.state is not None or result.changed:
-            self._review_state_result = result
+        # Every enabled, unblocked round advances state — even a first round with
+        # zero findings — so the round line renders and a baseline state comment
+        # is written.
+        self._review_state_result = result
 
     def _should_publish_review_no_suggestions(self, pr_review: str) -> bool:
         return get_settings().pr_reviewer.get('publish_output_no_suggestions', True) or "No major issues detected" not in pr_review
@@ -662,10 +769,18 @@ class PRReviewer:
 
         if self.patches_diff:
             get_logger().debug("PR diff", diff=self.patches_diff)
+            try:
+                files, clipped = extract_reviewed_files(self.patches_diff)
+            except Exception:
+                files, clipped = ([], set())
+            self._review_calls = [(files, clipped, None)]
+            self._review_uncovered_files = set(self.remaining_files_list or []) | set(clipped)
             self.prediction = await self._get_prediction(model)
         else:
             get_logger().warning(f"Empty diff for PR: {self.pr_url}")
             self.prediction = None
+            self._review_calls = []
+            self._review_uncovered_files = set()
 
     async def _prepare_chunked_prediction(self, model: str) -> bool:
         """Review a too-large diff in chunks and merge the per-chunk verdicts.
@@ -690,11 +805,18 @@ class PRReviewer:
             return_exceptions=True)
 
         raw_predictions, chunk_outputs, chunk_errors = [], [], []
+        review_calls: list = []
+        uncovered: set[str] = set()
         for chunk_index, prediction in enumerate(predictions):
+            try:
+                chunk_files, _ = extract_reviewed_files(patches_diff_list[chunk_index])
+            except Exception:
+                chunk_files = []
             if isinstance(prediction, Exception):
                 chunk_errors.append(prediction)
                 get_logger().warning(f"Failed to review chunk {chunk_index + 1}; retaining successful chunks",
                                      artifact={"error": prediction})
+                uncovered.update(chunk_files)
                 continue
             if isinstance(prediction, BaseException):
                 raise prediction
@@ -702,9 +824,22 @@ class PRReviewer:
             if not isinstance(data, dict) or not isinstance(data.get("review"), dict):
                 get_logger().warning(f"Failed to parse the review of chunk {chunk_index + 1}",
                                      artifact={"data": data})
+                uncovered.update(chunk_files)
                 continue
             raw_predictions.append(prediction)
             chunk_outputs.append(data)
+            try:
+                files, clipped = extract_reviewed_files(patches_diff_list[chunk_index])
+            except Exception:
+                files, clipped = ([], set())
+            count = self._review_chunk_issue_count(data)
+            review_calls.append((files, clipped, count))
+            if count is None:
+                # Parsed but without a key-issues list: UNKNOWN. Treat like a
+                # failed chunk for coverage (files stay unresolvable, run partial).
+                uncovered.update(files)
+            else:
+                uncovered.update(clipped)
 
         if not chunk_outputs:
             if chunk_errors:
@@ -718,6 +853,8 @@ class PRReviewer:
         self.review_chunk_count = len(patches_diff_list)
         self.review_failed_chunk_count = len(patches_diff_list) - len(chunk_outputs)
         self.remaining_files_list = remaining_files_list
+        self._review_calls = review_calls
+        self._review_uncovered_files = set(remaining_files_list or []) | uncovered
         return True
 
     async def _get_prediction(self, model: str, patches_diff: Optional[str] = None) -> str:
@@ -795,6 +932,7 @@ class PRReviewer:
             key_issues_to_review = data['review'].pop('key_issues_to_review')
             data['review']['key_issues_to_review'] = key_issues_to_review
 
+        self._review_inline_published = 0
         self._prepare_review_finding_state(data)
         if get_settings().config.publish_output and get_settings().pr_reviewer.get('inline_key_issues', False):
             data = self._publish_key_issues_as_inline_comments(data)
@@ -847,37 +985,29 @@ class PRReviewer:
         if get_settings().get('config', {}).get('output_run_details', False):
             markdown_text += show_run_details(self.git_provider.is_supported("gfm_markdown"))
 
+        # Funnel fork: visible review never carries state; round summary plus trimmed resolved section only.
         if self._review_state_result is not None:
             state_result = self._review_state_result
             try:
-                markdown_text = append_review_state(
-                    markdown_text or "",
-                    state_result.state,
-                    max_chars=self._review_comment_max_chars(),
+                new_count = len(getattr(state_result, "new_ids", ()) or ())
+                open_count = len(getattr(state_result, "open_ids", ()) or ())
+                resolved_count = len(getattr(state_result, "resolved_ids", ()) or ())
+                inline_count = int(getattr(self, "_review_inline_published", 0) or 0)
+                last_run = state_result.state.get("last_run", {}) if isinstance(state_result.state, dict) else {}
+                complete = bool(last_run.get("complete", False))
+                uncovered = self._round_uncovered_count(complete)
+                summary = build_round_summary(
+                    self._review_head_sha(),
+                    new_count, open_count, resolved_count, inline_count, complete, uncovered,
                 )
-            except ValueError as error:
-                previous_state = getattr(self, "_review_finding_previous_state", None)
-                self._review_state_result = None
-                self._review_state_blocked = True
-                self._review_state_block_reason = _STATE_BLOCK_SIZE
-                get_logger().warning(
-                    f"Persistent review state did not fit the provider comment limit; "
-                    f"publishing the review without advancing state: {error}"
-                )
-                if previous_state is not None:
-                    try:
-                        markdown_text = append_review_state(
-                            markdown_text or "",
-                            previous_state,
-                            max_chars=self._review_comment_max_chars(),
-                        )
-                    except ValueError as previous_error:
-                        get_logger().warning(
-                            f"Previous persistent review state also did not fit the provider "
-                            f"comment limit; leaving the existing state untouched: {previous_error}"
-                        )
-                    else:
-                        self._review_state_preserved = True
+                markdown_text = insert_round_summary(markdown_text or "", summary)
+            except Exception as e:
+                get_logger().warning(f"Failed to render review round summary, error: {e}")
+            markdown_text = append_review_state(
+                markdown_text or "",
+                state_result.state,
+                max_chars=self._review_comment_max_chars(),
+            )
 
         # Emit the review to optional external sinks (stdout/file/webhook/slack); no-op unless enabled.
         # publish_output gates it so a dry run makes no external calls. The "no major issues"
@@ -948,6 +1078,7 @@ class PRReviewer:
         return {fingerprint for fingerprint in fingerprints if store.seen(fingerprint)}
 
     def _publish_key_issues_as_inline_comments(self, data: dict) -> dict:
+        self._review_inline_published = 0
         issues = (data.get("review") or {}).get("key_issues_to_review")
         if not isinstance(issues, list) or not issues:
             return data
@@ -986,6 +1117,7 @@ class PRReviewer:
         candidate_issues = {}
         candidate_fingerprints = {}
         published = 0
+        newly_verified = 0
         for issue in issues:
             try:
                 comment = self._build_key_issue_comment(issue, diff_files)
@@ -1051,6 +1183,7 @@ class PRReviewer:
                     store.add(candidate_fingerprints[location_fingerprint])
                     store.add(location_fingerprint)
                     published += len(issues_for_location)
+                    newly_verified += 1
                     continue
                 get_logger().warning("Failed to publish a review finding as an Azure DevOps inline comment, "
                                      "keeping it in the summary",
@@ -1059,6 +1192,7 @@ class PRReviewer:
                                                "end_line": comment["relevant_lines_end"]})
                 remaining_issues.extend(issues_for_location)
 
+        self._review_inline_published = newly_verified
         if not published:
             return data
         get_logger().info(f"Published {published} review finding(s) as inline comments")

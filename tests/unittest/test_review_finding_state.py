@@ -379,28 +379,9 @@ def test_resolved_render_is_collapsed_and_state_marker_is_hidden():
     assert "<details>" in body
     assert "Resolved findings" in body
     assert "The lock is never released." in body
-    assert "<!-- pr-agent-review-state:v1" in body
-
-
-def test_append_review_state_reserves_space_for_complete_marker():
-    state = reconcile_review_findings(
-        None,
-        [_finding()],
-        allow_resolution=True,
-        timestamp="2026-01-01T00:00:00Z",
-    ).state
-    marker = serialize_review_state(state)
-
-    body = append_review_state(
-        "human-readable review " + "x" * 500,
-        state,
-        max_chars=len(marker) + 32,
-    )
-
-    parsed = parse_review_state(body)
-    assert len(body) <= len(marker) + 32
-    assert parsed.valid is True
-    assert parsed.state == state
+    # The visible review never carries the hidden state marker; state lives in its own comment.
+    assert "<!-- pr-agent-review-state:" not in body
+    assert parse_review_state(body).present is False
 
 
 def test_resolved_retention_never_drops_active_findings():
@@ -467,24 +448,18 @@ def test_parse_duplicate_marker_uses_namespace_guard_before_regex(monkeypatch):
     assert parsed.valid is False
 
 
-def test_append_duplicate_marker_uses_namespace_guard_before_substitution(monkeypatch):
+def test_append_never_alters_review_markdown():
     state = reconcile_review_findings(
         None,
         [_finding()],
         allow_resolution=True,
         timestamp="2026-01-01T00:00:00Z",
     ).state
+    quoted = "<!-- pr-agent-review-state:v1\nquoted text\n-->"
+    body = f"human review quoting {quoted} verbatim\n"
 
-    class RejectingPattern:
-        def sub(self, *_args, **_kwargs):
-            raise AssertionError("regex substitution should not run for duplicate markers")
-
-    monkeypatch.setattr(state_module, "_STATE_MARKER_RE", RejectingPattern())
-    body = (
-        f"human review\n{state_module._STATE_MARKER_NAMESPACE} first\n"
-        f"{state_module._STATE_MARKER_NAMESPACE} second"
-    )
+    assert append_review_state(body, {"schema_version": 1, "findings": [], "last_run": {}}) == body
 
     result = append_review_state(body, state)
-
-    assert result.count(state_module._STATE_MARKER_NAMESPACE) == 1
+    assert result.startswith(body)
+    assert quoted in result

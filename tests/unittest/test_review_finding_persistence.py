@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from pr_agent.algo.review_finding_state import build_review_state_comment, reconcile_review_findings
+from pr_agent.algo.utils import PRReviewStateIdentity
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import GitProvider
 from pr_agent.tools.pr_reviewer import PRReviewer
@@ -162,26 +164,36 @@ def test_stateful_mode_is_disabled_for_generic_persistent_publisher(monkeypatch)
     assert reviewer._review_finding_state_enabled() is False
 
 
-def test_malformed_state_marker_is_replaced_without_duplicate_comment():
-    header = "## PR Reviewer Guide 🔍"
-    body = f"{header}\n\nold review\n\n<!-- pr-agent-review-state:v1\nnot-json\n-->"
+def test_malformed_state_comment_is_replaced_without_duplicate_comment():
+    body = (
+        f"{PRReviewStateIdentity.STATE.value}\n\n<sub>state</sub>\n\n"
+        "<!-- pr-agent-review-state:v1\nnot-json\n-->"
+    )
     comment = SimpleNamespace(body=body)
     provider = MagicMock()
     _set_issue_comments(provider, [comment])
     provider.get_latest_commit_url.return_value = "commit-url"
     provider.get_comment_url.return_value = "comment-url"
+    fresh = reconcile_review_findings(
+        None,
+        [{"body": "finding", "path": "app.py", "line_start": 1, "line_end": 1}],
+        allow_resolution=False,
+        timestamp="2026-01-01T00:00:00Z",
+    ).state
 
     result = GitProvider.publish_persistent_comment_full(
         provider,
-        "new review",
-        initial_header=header,
+        build_review_state_comment(fresh),
+        initial_header=PRReviewStateIdentity.STATE.value,
         update_header=False,
         final_update_message=False,
+        identity_marker=PRReviewStateIdentity.STATE.value,
+        require_agent_authorship=True,
         fallback_on_error=False,
     )
 
     assert result is comment
-    provider.edit_comment.assert_called_once_with(comment, "new review")
+    provider.edit_comment.assert_called_once_with(comment, build_review_state_comment(fresh))
     provider.publish_comment.assert_not_called()
 
 
