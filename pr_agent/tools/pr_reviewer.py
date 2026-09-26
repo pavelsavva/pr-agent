@@ -594,24 +594,18 @@ class PRReviewer:
         calls = getattr(self, "_review_calls", None)
         if calls is None:
             calls = []
-            calls_missing = True
-        else:
-            calls_missing = False
         try:
             max_findings = int(get_settings().pr_reviewer.num_max_findings)
         except (TypeError, ValueError):
             max_findings = 0
-        remaining = list(getattr(self, "remaining_files_list", None) or [])
         failed_chunks = int(getattr(self, "review_failed_chunk_count", 0) or 0)
         resolvable: set[str] = set()
-        clipped_all: set[str] = set()
         for entry in calls:
             try:
                 files, clipped, count = entry
             except (TypeError, ValueError):
                 continue
             clipped_set = set(clipped or [])
-            clipped_all.update(clipped_set)
             if count is None:
                 continue
             try:
@@ -631,16 +625,14 @@ class PRReviewer:
                 path = str(finding.get("path") or "").strip().strip(chr(96)).lstrip("/")
                 if path and path not in diff_paths:
                     resolvable.add(path)
+        # Production always records the covered/uncovered set (single-call and
+        # chunked flows); a missing recording means the run cannot claim
+        # completeness, so None forces complete=False with no fallback.
         recorded_uncovered = getattr(self, "_review_uncovered_files", None)
         if recorded_uncovered is not None:
             complete = not bool(set(recorded_uncovered)) and failed_chunks == 0
         else:
-            complete = (
-                not calls_missing
-                and not bool(remaining)
-                and failed_chunks == 0
-                and not bool(clipped_all)
-            )
+            complete = False
         return (resolvable, complete)
 
     def _round_uncovered_count(self, complete: bool) -> int:

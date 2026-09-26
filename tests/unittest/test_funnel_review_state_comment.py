@@ -213,6 +213,8 @@ def test_chunked_complete_with_total_over_cap_still_resolves(monkeypatch):
         (["a.py", "b.py"], set(), 2),
         (["c.py", "d.py"], set(), 2),
     ]
+    # Production records the uncovered set for every chunked call.
+    reviewer._review_uncovered_files = set()
     resolvable, complete = reviewer._compute_resolvable_paths(previous)
     assert complete is True
     assert {"a.py", "b.py", "c.py", "d.py"} <= set(resolvable)
@@ -321,6 +323,7 @@ def test_legacy_marker_in_review_is_ignored_and_migrates(monkeypatch):
     current = [_finding("fresh one", "new.py", start=3), _finding("fresh two", "other.py", start=4)]
     reviewer.prediction = "prediction"
     reviewer._review_calls = [(["new.py", "other.py"], set(), 2)]
+    reviewer._review_uncovered_files = set()
     provider.get_diff_files.return_value = [SimpleNamespace(filename="new.py"),
                                             SimpleNamespace(filename="other.py")]
     reviewer._prepare_review_finding_state({"review": {"key_issues_to_review": [
@@ -519,6 +522,8 @@ def test_compute_resolvable_paths_classifies_each_file(monkeypatch):
         (["c.py"], set(), 3),
         (["f.py", "g.py"], {"f.py"}, 1),
     ]
+    # Production records budget-excluded and clipped files as uncovered.
+    reviewer._review_uncovered_files = {"b.py", "f.py"}
 
     resolvable, complete = reviewer._compute_resolvable_paths(previous)
 
@@ -829,6 +834,7 @@ def test_first_round_with_no_findings_renders_round_line_and_baseline_state(monk
     provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
     reviewer = _reviewer(provider, monkeypatch)
     reviewer._review_calls = [([], set(), 0)]
+    reviewer._review_uncovered_files = set()
     reviewer.review_failed_chunk_count = 0
 
     with (
@@ -965,6 +971,51 @@ async def test_unknown_chunk_files_are_uncovered_and_run_partial(monkeypatch):
     assert reviewer._round_uncovered_count(False) == 1
 
 
+async def test_non_list_key_issues_chunk_files_are_uncovered_and_not_resolvable(monkeypatch):
+    settings = get_settings()
+    monkeypatch.setattr(settings.pr_reviewer, "max_number_of_calls", 3, raising=False)
+    monkeypatch.setattr(settings.pr_reviewer, "num_max_findings", 3)
+    provider = MagicMock()
+    provider.last_commit_id = "head-1"
+    provider.get_issue_comments.return_value = []
+    provider.get_diff_files.return_value = [
+        SimpleNamespace(filename="ok.py"), SimpleNamespace(filename="odd.py"),
+    ]
+    provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
+    reviewer = _reviewer(provider, monkeypatch)
+    reviewer.token_handler = MagicMock()
+    chunk_diffs = [
+        "## File: 'ok.py'\n\n@@ -1 +1 @@\n-a\n+b\n",
+        "## File: 'odd.py'\n\n@@ -1 +1 @@\n-a\n+b\n",
+    ]
+    known_yaml = (
+        "review:\n"
+        "  key_issues_to_review:\n"
+        "    - relevant_file: ok.py\n"
+        "      issue_content: known finding\n"
+        "      start_line: 1\n"
+        "      end_line: 1\n"
+    )
+    # key_issues_to_review present but not a list: the chunk has an UNKNOWN
+    # count, so its files stay uncovered and the run is partial.
+    string_yaml = "review:\n  key_issues_to_review: just-a-string\n"
+    with patch(
+        "pr_agent.tools.pr_reviewer.get_pr_multi_diffs",
+        return_value=(chunk_diffs, []),
+    ):
+        reviewer._get_prediction = AsyncMock(side_effect=[known_yaml, string_yaml])
+        assert await reviewer._prepare_chunked_prediction("model") is True
+
+    assert reviewer._review_calls == [(["ok.py"], set(), 1), (["odd.py"], set(), None)]
+    assert reviewer._review_uncovered_files == {"odd.py"}
+
+    previous = _previous_with_paths("ok.py", "odd.py")
+    resolvable, complete = reviewer._compute_resolvable_paths(previous)
+    assert complete is False
+    assert "ok.py" in resolvable
+    assert "odd.py" not in resolvable
+
+
 async def test_uncovered_files_count_six(monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings.pr_reviewer, "max_number_of_calls", 3, raising=False)
@@ -1072,6 +1123,8 @@ async def test_run_migrates_legacy_review_and_reconciles_second_run(monkeypatch)
             "## File: 'n1.py'\n+x\n\n## File: 'n2.py'\n+x\n\n## File: 'n3.py'\n+x\n"
         )
         reviewer._review_calls = [(["n1.py", "n2.py", "n3.py"], set(), None)]
+        # Production _prepare_prediction records the uncovered set alongside the call.
+        reviewer._review_uncovered_files = set()
         reviewer.remaining_files_list = []
         reviewer.review_failed_chunk_count = 0
 

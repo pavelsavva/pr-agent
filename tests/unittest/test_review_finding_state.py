@@ -463,3 +463,39 @@ def test_append_never_alters_review_markdown():
     result = append_review_state(body, state)
     assert result.startswith(body)
     assert quoted in result
+
+
+def test_unreviewed_active_finding_stays_open_and_counts_as_open():
+    previous = reconcile_review_findings(
+        None,
+        [_finding()],
+        allow_resolution=True,
+        head_sha="head-1",
+        timestamp="2026-01-01T00:00:00Z",
+    ).state
+    previous_id = previous["findings"][0]["finding_id"]
+    # The file left the token budget, so this run reviewed nothing and the
+    # previous ACTIVE finding could not be resolved.
+    result = reconcile_review_findings(
+        previous,
+        [],
+        allow_resolution=True,
+        excluded_files=["app.py"],
+        head_sha="head-2",
+        timestamp="2026-01-01T00:01:00Z",
+        resolvable_paths=set(),
+        complete=False,
+    )
+
+    assert result.state["findings"][0]["state"] == "ACTIVE"
+    assert result.open_ids == (previous_id,)
+    assert result.new_ids == ()
+    assert result.resolved_ids == ()
+    summary = state_module.build_round_summary(
+        "head-2", len(result.new_ids), len(result.open_ids),
+        len(result.resolved_ids), 0, False, 1,
+    )
+    hidden, visible = summary.split("\n")
+    assert hidden == ("<!-- pr-agent-review-round:v1 head=head-2 new=0 open=1 resolved=0 "
+                      "inline=0 complete=false -->")
+    assert "1 still open from earlier rounds" in visible

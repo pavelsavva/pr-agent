@@ -469,18 +469,24 @@ def reconcile_review_findings(
         if finding_id in reconciled or finding_id in matched_previous:
             continue
         record = copy.deepcopy(previous)
-        if record.get("state") == "ACTIVE" and resolution_allowed:
-            path = _normalize_path(record.get("path"))
-            resolvable = True if resolvable_set is None else path in resolvable_set
-            if resolvable:
-                record["state"] = "RESOLVED"
-                record["resolved_at"] = now
-                if head_sha:
-                    record["resolved_head_sha"] = head_sha
-                if run_id:
-                    record["resolution_run_id"] = run_id
-                resolved_ids.append(finding_id)
-                changed = True
+        if record.get("state") == "ACTIVE":
+            if resolution_allowed:
+                path = _normalize_path(record.get("path"))
+                resolvable = True if resolvable_set is None else path in resolvable_set
+                if resolvable:
+                    record["state"] = "RESOLVED"
+                    record["resolved_at"] = now
+                    if head_sha:
+                        record["resolved_head_sha"] = head_sha
+                    if run_id:
+                        record["resolution_run_id"] = run_id
+                    resolved_ids.append(finding_id)
+                    changed = True
+            if record.get("state") == "ACTIVE":
+                # Still open after this run (unreviewed file, capped call,
+                # same-head rerun, or blocked resolution): count it so the
+                # round line never claims "0 still open" while state holds it.
+                open_ids.append(finding_id)
         reconciled[finding_id] = record
 
     run_complete = bool(allow_resolution) if complete is None else bool(complete)

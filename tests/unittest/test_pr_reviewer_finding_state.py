@@ -90,6 +90,8 @@ def test_prepare_review_reconciles_previous_state_and_renders_resolved_section(m
     provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["app.py"], set(), 0)]
+    # Production records the uncovered set for every reviewed call.
+    reviewer._review_uncovered_files = set()
 
     with (
         patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
@@ -124,6 +126,7 @@ def test_prepare_review_same_head_absence_preserves_active_finding(monkeypatch):
     )
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["app.py"], set(), 0)]
+    reviewer._review_uncovered_files = set()
 
     reviewer._prepare_review_finding_state(
         {"review": {"key_issues_to_review": []}}
@@ -154,6 +157,7 @@ def test_prepare_review_pushes_final_markdown_with_lifecycle_state(monkeypatch):
     provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["app.py"], set(), 0)]
+    reviewer._review_uncovered_files = set()
 
     with (
         patch("pr_agent.tools.pr_reviewer.load_yaml", return_value={"review": {"key_issues_to_review": []}}),
@@ -414,6 +418,7 @@ def test_malformed_state_comment_self_heals_by_overwriting_it(monkeypatch):
     provider.edit_comment.side_effect = edit_comment
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["app.py"], set(), 1)]
+    reviewer._review_uncovered_files = set()
     reviewer._review_finding_state_enabled = MagicMock(return_value=True)
     issue = {
         "relevant_file": "app.py",
@@ -499,6 +504,7 @@ def test_prepare_and_persisted_state_round_trip_preserves_history_without_marker
     )
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["a.py"], set(), 1)]
+    reviewer._review_uncovered_files = set()
     reviewer._review_finding_state_enabled = MagicMock(return_value=True)
     issue = {
         "relevant_file": "a.py",
@@ -550,15 +556,18 @@ def test_prepare_and_persisted_state_round_trip_preserves_history_without_marker
 
 
 @pytest.mark.parametrize(
-    ("incremental", "remaining_files", "prediction", "calls"),
+    ("incremental", "remaining_files", "prediction", "calls", "uncovered"),
     [
-        pytest.param(True, [], "prediction", [(["app.py"], set(), 0)], id="incremental"),
-        pytest.param(False, ["app.py"], "prediction", [], id="token-excluded"),
-        pytest.param(False, [], "", [(["app.py"], set(), 0)], id="prediction-failed"),
+        # Incremental: reviewed everything, but the incremental gate blocks resolution.
+        pytest.param(True, [], "prediction", [(["app.py"], set(), 0)], set(), id="incremental"),
+        # Token-excluded: app.py left the budget, so production records it uncovered.
+        pytest.param(False, ["app.py"], "prediction", [], {"app.py"}, id="token-excluded"),
+        # Failed prediction: reviewed everything, but the empty prediction blocks resolution.
+        pytest.param(False, [], "", [(["app.py"], set(), 0)], set(), id="prediction-failed"),
     ],
 )
 def test_missing_findings_resolve_only_after_complete_successful_review(
-    monkeypatch, incremental, remaining_files, prediction, calls
+    monkeypatch, incremental, remaining_files, prediction, calls, uncovered
 ):
     _settings(monkeypatch)
     previous = reconcile_review_findings(
@@ -580,6 +589,7 @@ def test_missing_findings_resolve_only_after_complete_successful_review(
     reviewer.remaining_files_list = remaining_files
     reviewer.prediction = prediction
     reviewer._review_calls = calls
+    reviewer._review_uncovered_files = uncovered
     # Exercise the reconciliation guard directly even though incremental stateful
     # publishing is disabled by the feature gate.
     reviewer._review_finding_state_enabled = MagicMock(return_value=True)
@@ -612,6 +622,7 @@ def test_absent_findings_resolve_after_complete_successful_review(monkeypatch):
     provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
     reviewer = _reviewer(provider)
     reviewer._review_calls = [(["app.py"], set(), 0)]
+    reviewer._review_uncovered_files = set()
     reviewer._review_finding_state_enabled = MagicMock(return_value=True)
 
     reviewer._prepare_review_finding_state({"review": {"key_issues_to_review": []}})
@@ -651,7 +662,14 @@ def test_finding_limit_prevents_resolution_of_missing_active_findings(monkeypatc
     ]
     provider.is_supported.side_effect = lambda capability: capability == "get_issue_comments"
     reviewer = _reviewer(provider)
-    reviewer._review_calls = [(["d.py", "e.py", "f.py"], set(), None)]
+    # The single recorded call covers every file (a-f), so that ONLY the finding
+    # cap (3 current findings vs num_max_findings 3) keeps a/b/c ACTIVE: if the
+    # cap check is removed, or the deferred count is filled with 0, the call no
+    # longer counts as capped and a/b/c wrongly resolve.
+    reviewer._review_calls = [
+        (["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"], set(), None)
+    ]
+    reviewer._review_uncovered_files = set()
     reviewer._review_finding_state_enabled = MagicMock(return_value=True)
 
     reviewer._prepare_review_finding_state({"review": {"key_issues_to_review": current_findings}})
